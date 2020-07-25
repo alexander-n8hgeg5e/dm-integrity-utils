@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+from subprocess import check_call,check_output
+from sys import exit
+from collections import OrderedDict as Od
+from os.path import basename
+from os import sync
+from pprint import pprint
+
+SUPERBLOCK_HEADER_INFO_KEYS =   [
+                                ('Interleave sectors',            int                      ,"{}"),
+                                ('Tag size per-sector',           int                      ,"{}"),
+                                ('Size of journal',               int                      ,"{}"),
+                                ('Available size for data',       int                      ,"{}"),
+                                ('Flags',                         lambda x : int(x,base=16),"0x{:02X}"),
+                                ('Sectors per block',             int                      ,"{}"),
+                                ]
+
+class UserAbort(Exception):
+    pass
+
+def parse_args():
+    from argparse import ArgumentParser
+    ap=ArgumentParser()
+    ap.add_argument("-n","--dry-run",action="store_true",default=False)
+    ap.add_argument("-v","--verbose", action="count")
+    ap.add_argument (
+                    "--format-device",
+                    '-f'
+                    ,metavar=('name','dev'),
+                    nargs=2,
+                    )
+    ap.add_argument("--activate-target",'-a',metavar=('name','dev'),nargs=2)
+    ap.add_argument ("--inactivate-target", '-d',
+                    metavar=('name'), nargs=1,
+                    help="""\nif more than one of -f -a -d is specified,
+                         they will be done in the order -f -a -d .
+                         -f leaves the device inactivated after formating"""
+                    )
+    ap.add_argument("-l", "--list", action="store_true")
+    global args
+    args=ap.parse_args()
+
+def unload_target(name,dry_run=True,verbose=False):
+    if args.verbose or verbose:
+        print("unloading target name={} ...".format(name))
+    cmd=['dmsetup','remove',name]
+    if args.dry_run or args.verbose:
+        print("cmd: {}".format(cmd))
+    if not args.dry_run:
+        check_call(cmd)
+
+def zero_out_first_512(dev,dry_run=True):
+    if args.verbose:
+        print("erasing first 512 bytes of \"{}\" ...".format(dev))
+    cmd = ['dd','if=/dev/zero','of='+dev , "bs=512" , "count=1" ,"status=none"]
+    if args.dry_run or args.verbose:
+        print("cmd: {}".format(cmd))
+    if not args.dry_run:
+        check_call(cmd)
+
+def initialize_hashes(name,dev,sectors):
+    # first check to be sure the right device will be wiped
+    # In case a mapping with the name has already existed
+    # and so is not the newly formated one, whyever,
+    # and the program will come to this place
+    # it has to cancel the operation.
+    # Because the user supplied a devicename that he agreed to wipe,
+    # an additional check for the device to name relationship
+    # will adress the situation.
+    cmd = [ 'dmsetup', 'deps', '-o', 'blkdevname' ]
+    lines = check_output(cmd).decode().strip().split("\n")
+    bn = basename(dev)
+    found=False
+    for line in lines:
+        if line[:len(name)+1] == name+':':
+            if line.strip()[ - len(bn) - 4 : ] == ": ("+bn+")":
+                found=True
+    if not found:
+        raise Exception("ERROR: No entry in device mapper table found thats corresponds to the expected blockdev({})<->mapping-name({}) pairing".format(dev,name))
+    device2wipe='/dev/mapper/'+name
+    cmd=[ 'dd', 'if=/dev/zero', 'of='+device2wipe, 'count='+str(sectors), 'oflag=direct','status=none' ]
+    if args.verbose:
+        print("To produce valid hashes on the integrity target a full wipeout is required. device=\"{}\" ... ".format(device2wipe))
+        print("cmd: {}".format(cmd))
+    r = input('The path "{}" belongs to the just activated device. Continue ? (Y/[n])'.format(device2wipe))
+    if not r == "Y":
+        raise UserAbort()
+    check_call(cmd)
+    sync()
+
+def make_table_arg(start_sector,end_sector,arguments):
+    table="{:d} {:d} integrity {}"
+    try:
+        table=table.format(start_sector,end_sector," ".join([str(a) for a in arguments]))
+    except:
+        print("ERROR: failed to create table, vars: a={} ss={} es={}".format(arguments,start_sector,end_sector))
+        raise
+    return table
+
+def get_superblock_info(dev):
+    if args.verbose:
+        print("obtaining dev info from superblock ...".format(dev))
+    cmd=['dump-integrity-header-info',dev]
+    lines=check_output(cmd).decode().strip().split("\n")
+    data={}
+    format_data={}
+    for line in lines:
+        for hk in SUPERBLOCK_HEADER_INFO_KEYS:
+            hk, type, fo = hk
+            if len(line) >= len(hk) and line[:len(hk)+1] == hk+":":
+                val =  line[len(hk)+1:].strip()
+                data.update(       { hk : type(val) })
+                format_data.update({ hk : fo        })
+    return data,format_data
+
+def make_default_standalone_target_args(name,dev,end_sector):
+    """
+    makes args suitable for activate_target function
+    default standalone args
+    """
+    a=Od(
+        name                          = name,
+        start_sector                  = 0,
+        end_sector                    = end_sector,
+        dev                           = dev,
+        num_reserved_start_sectors    = 0,
+        integrity_tag_size            = '-',
+        mode                          = 'J',
+        # specifying internal_hash makes the target work standalone 
+        # (no tags accepted from an upper layer target like dm-crypt)
+        internal_hash                 = "crc32",
+        journal_crypt                 = None, # None means will not be added
+        journal_mac                   = None, # None means will not be added
+        more_args                     = [],
+        )
+    return a
+
+def activate_target    ( 
+                    name,
+                    start_sector,
+                    end_sector,
+                    dev, 
+                    num_reserved_start_sectors,
+                    integrity_tag_size,
+                    mode,
+                    internal_hash,
+                    journal_crypt,
+                    journal_mac,
+                    more_args,
+                    dry_run=True,
+                    ):
+    """
+    activates the target in standalone mode
+    uses the available sectors read from the superblock
+    """
+    if args.verbose:
+        print("loading target with sector range {} to {} ...".format(start_sector,end_sector))
+    additional_args = []
+    for k,v in {'internal_hash':internal_hash,'journal_crypt':journal_crypt,'journal_mac':journal_mac}.items():
+        if not v is None and len(v) > 0:
+            additional_args.append(k+":"+v)
+    additional_args += more_args
+    num_additional_args = len(additional_args)
+    table = make_table_arg(start_sector,end_sector,[dev,num_reserved_start_sectors,integrity_tag_size,mode,num_additional_args]+additional_args)
+    cmd=['dmsetup', 'create', name, '--table', table]
+    if args.dry_run or args.verbose:
+        print("cmd: {}".format(cmd))
+    if not args.dry_run:
+        check_call(cmd)
+
+def format_device(name,dev,dry_run=True):
+    """
+    Format device like gentoo wiki describes in standalone mode.
+    This will overwrite many parts of the target device and causes the data to be lost.
+    Do not use on devices that contain data.
+    https://wiki.gentoo.org/wiki/Device-mapper#Integrity
+     doc in kernel tree: linux-kernel-tree-root/Documentation/admin-guide/device-mapper/dm-integrity.rst
+     Internal_hash, journal_crypt, and journal_mac are NOT saved to the superblock, but must be reproduced
+    for every target activation.
+    The options used here are a configuration for standalone mode.
+    """
+    print("Do you want to proceed formating the device \"{}\" with integrity target ?".format(dev))
+    print("This will DESTROY ALL DATA on the device !")
+    r=input("Do you want to continue and wipeout the devive \"{}\" ???  (Y/[n])".format(dev))
+    if not r == "Y":
+        raise UserAbort()
+    print("...")
+    global args
+    zero_out_first_512(dev,dry_run=dry_run)
+    a = make_default_standalone_target_args(name,dev,1)
+    if args.verbose:
+        print("formating dev \"{}\" with new superblock ...".format(dev))
+    activate_target(*[v for v in a.values() ],dry_run=dry_run)
+    unload_target(name)
+    superblock_info,superblock_format_data = get_superblock_info(dev)
+    sectors=superblock_info['Available size for data']
+    max_len=max([len(i) for i in superblock_info.keys()])
+    if args.verbose:
+        for k,v in superblock_info.items():
+            print(("{:>"+str(max_len)+"} = "+superblock_format_data[k]).format(k,v))
+    a['end_sector']= sectors # TODO: check is end sector included ?
+    activate_target(*[v for v in a.values() ],dry_run=dry_run)
+    try:
+        initialize_hashes(name,dev,sectors)
+    except UserAbort:
+        unload_target(name,verbose=True)
+        raise
+    unload_target(name)
+    return a
+
+def activate_standalone_target(name,dev,dry_run=True):
+    """
+    """
+    superblock_info,superblock_format_data = get_superblock_info(dev)
+    sectors = superblock_info['Available size for data']
+    max_len=max([len(i) for i in superblock_info.keys()])
+    if args.verbose:
+        for k,v in superblock_info.items():
+            print(("{:>"+str(max_len)+"} = "+superblock_format_data[k]).format(k,v))
+    a = make_default_standalone_target_args(name,dev,sectors) # TODO: check is end sector included ?
+    activate_target(*[v for v in a.values() ],dry_run=dry_run)
+
+def list_activated_targets():
+    cmd=['dmsetup','table',]
+    lines = check_output(cmd).decode().strip().split("\n")
+    for line in lines:
+        if line.strip().split(" ")[3] == "integrity":
+            print(line)
+
+def main():
+    if not args.format_device is None and len(args.format_device) == 2:
+        name,dev = args.format_device
+        a=format_device(name,dev,dry_run=args.dry_run)
+        print("...\nIntegrity target preparation accomplished.")
+        pprint(a)
+    if not args.activate_target is None and len(args.activate_target) == 2:
+        name,dev = args.activate_target
+        activate_standalone_target(name,dev,dry_run=args.dry_run)
+    if not args.inactivate_target is None:
+        unload_target(args.inactivate_target[0])
+    if args.list:
+        list_activated_targets()
+
+if __name__=="__main__":
+    try:
+        parse_args()
+        main()
+    except UserAbort:
+        print("operation aborted")
+        exit(1)
