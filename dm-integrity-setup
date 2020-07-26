@@ -2,8 +2,8 @@
 from subprocess import check_call,check_output
 from sys import exit
 from collections import OrderedDict as Od
-from os.path import basename
-from os import sync
+from os.path import basename,islink
+from os import sync,readlink
 from pprint import pprint
 
 SUPERBLOCK_HEADER_INFO_KEYS =   [
@@ -20,7 +20,7 @@ class UserAbort(Exception):
 
 def parse_args():
     from argparse import ArgumentParser
-    ap=ArgumentParser()
+    ap=ArgumentParser(description="This tool helps to activate, inactivate and list standalone integrity targets and also to format/prepare the underlaying devices. A default set of options is used that is suitable for the standalone target. The program shows all the used options after formating. In verbose mode the calls to dmsetup are shown.")
     ap.add_argument("-n","--dry-run",action="store_true",default=False)
     ap.add_argument("-v","--verbose", action="count")
     ap.add_argument (
@@ -70,6 +70,9 @@ def initialize_hashes(name,dev,sectors):
     cmd = [ 'dmsetup', 'deps', '-o', 'blkdevname' ]
     lines = check_output(cmd).decode().strip().split("\n")
     bn = basename(dev)
+    if islink(dev):
+        bn=basename(readlink(dev))
+
     found=False
     for line in lines:
         if line[:len(name)+1] == name+':':
@@ -82,7 +85,7 @@ def initialize_hashes(name,dev,sectors):
     if args.verbose:
         print("To produce valid hashes on the integrity target a full wipeout is required. device=\"{}\" ... ".format(device2wipe))
         print("cmd: {}".format(cmd))
-    r = input('The path "{}" belongs to the just activated device. Continue ? (Y/[n])'.format(device2wipe))
+    r = input('Next step will wipe the device at path "{}". Continue ? (Y/[n])'.format(device2wipe))
     if not r == "Y":
         raise UserAbort()
     check_call(cmd)
