@@ -52,7 +52,10 @@ def unload_target(name,dry_run=True,verbose=False):
 def zero_out_first_512(dev,dry_run=True):
     if args.verbose:
         print("erasing first 512 bytes of \"{}\" ...".format(dev))
-    cmd = ['dd','if=/dev/zero','of='+dev , "bs=512" , "count=1" ,"status=none"]
+    # need fdatasync to flush data to disk after the operation
+    # the dmsetup command seems to see the data
+    # as it is on the physical disk
+    cmd = ['dd','if=/dev/zero','of='+dev , "bs=512" , "count=1" ,"status=none","conv=fdatasync"]
     if args.dry_run or args.verbose:
         print("cmd: {}".format(cmd))
     if not args.dry_run:
