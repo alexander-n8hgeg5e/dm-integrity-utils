@@ -4,7 +4,7 @@ EAPI=7
 
 PYTHON_COMPAT=( python3_{6,7,8} )
 EGIT_REPO_URI="${CODEDIR}/${PN} ${MYGITHUB_URIBASE}${PN}.git"
-inherit git-r3 distutils-r1 scons-utils
+inherit git-r3 python-any-r1 scons-utils
 
 DESCRIPTION="tools to manage device-mapper integrity target"
 HOMEPAGE=""
