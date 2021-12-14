@@ -70,7 +70,7 @@ def initialize_hashes(name,dev,sectors):
     # Because the user supplied a devicename that he agreed to wipe,
     # an additional check for the device to name relationship
     # will adress the situation.
-    cmd = [ 'dmsetup', 'deps', '-o', 'blkdevname' ]
+    cmd = [ 'dmsetup', 'deps', '-o', 'blkdevname,devname' ]
     lines = check_output(cmd).decode().strip().split("\n")
     bn = basename(dev)
     if islink(dev):
